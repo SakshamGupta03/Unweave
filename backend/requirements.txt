@@ -8,9 +8,7 @@ numpy<2
 # PyTorch & Audio Separation Engine
 # NOTE: torch and torchaudio are pre-installed by the desktop runtime provisioner
 # using platform-specific index URLs before this file is processed.
-torch
-torchaudio
+# Do NOT add torch or torchaudio here — it causes double-resolution stalls.
 demucs
 scipy
-resampy
 imageio-ffmpeg

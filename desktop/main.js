@@ -2,7 +2,8 @@ const { app, BrowserWindow, Menu, shell, dialog, ipcMain } = require('electron')
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
+const os = require('os');
 
 // Global safety against unhandled process crashes
 process.on('uncaughtException', (err) => {
@@ -17,6 +18,55 @@ let backendProcess = null;
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
 const BACKEND_PORT = 8010;
 const BACKEND_URL = `http://127.0.0.1:${BACKEND_PORT}`;
+
+// ──────────────────────────────────────────────
+// Persistent Install Log File
+// ──────────────────────────────────────────────
+const LOG_FILE_PATH = path.join(app.getPath('userData'), 'unweave-install.log');
+let logStream = null;
+
+function initLogFile() {
+  try {
+    logStream = fs.createWriteStream(LOG_FILE_PATH, { flags: 'a', encoding: 'utf8' });
+    const separator = '\n' + '='.repeat(72) + '\n';
+    logStream.write(separator);
+    logStream.write(`[Session Start] ${new Date().toISOString()}\n`);
+    logStream.write(`[System] OS: ${os.type()} ${os.release()} (${os.arch()})\n`);
+    logStream.write(`[System] Platform: ${process.platform}\n`);
+    logStream.write(`[System] Node.js: ${process.version}\n`);
+    logStream.write(`[System] Electron: ${process.versions.electron}\n`);
+    logStream.write(`[System] App Packaged: ${app.isPackaged}\n`);
+    logStream.write(`[System] User Data: ${app.getPath('userData')}\n`);
+    logStream.write(separator);
+  } catch (err) {
+    console.warn('[Unweave Desktop] Could not create log file:', err.message);
+  }
+}
+
+function writeLog(message) {
+  const timestamp = new Date().toISOString();
+  const line = `[${timestamp}] ${message}\n`;
+  if (logStream) {
+    try {
+      logStream.write(line);
+    } catch {
+      // Silently continue if log write fails
+    }
+  }
+  console.log(message);
+}
+
+function closeLogFile() {
+  if (logStream) {
+    try {
+      logStream.write(`[Session End] ${new Date().toISOString()}\n`);
+      logStream.end();
+    } catch {
+      // Silently continue
+    }
+    logStream = null;
+  }
+}
 
 // ──────────────────────────────────────────────
 // Backend Health Checker
@@ -53,49 +103,238 @@ let engineState = {
 
 function broadcastEngineStatus(updates = {}) {
   Object.assign(engineState, updates);
+  // Write every status update to the persistent log file
+  if (updates.step) writeLog(`[Status] ${updates.step}`);
+  if (updates.detail) writeLog(`[Detail] ${updates.detail}`);
   if (mainWindow && mainWindow.webContents) {
     mainWindow.webContents.send('engine:status-update', engineState);
   }
 }
 
-function findSystemPython() {
-  const isWin = process.platform === 'win32';
-  const candidates = isWin
-    ? [
-        'py',
-        'python',
-        'python3',
-        path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Python', 'Python311', 'python.exe'),
-        path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Python', 'Python312', 'python.exe'),
-        path.join(process.env.ProgramFiles || '', 'Python311', 'python.exe'),
-        path.join(process.env.ProgramFiles || '', 'Python312', 'python.exe')
-      ]
-    : [
-        'python3',
-        '/opt/homebrew/bin/python3',
-        '/usr/local/bin/python3',
-        '/usr/bin/python3',
-        'python'
-      ];
-
-  for (const cmd of candidates) {
-    try {
-      const args = cmd === 'py' ? ['-3', '--version'] : ['--version'];
-      const res = require('child_process').spawnSync(cmd, args, {
-        encoding: 'utf8',
-        windowsHide: true
-      });
-      if (res.status === 0) {
-        return cmd === 'py' ? 'py -3' : cmd;
+// Returns the version tuple [major, minor] from a python executable, or null if it can't be determined.
+function getPythonVersion(cmd, extraArgs = []) {
+  try {
+    const res = require('child_process').spawnSync(
+      cmd,
+      [...extraArgs, '-c', 'import sys; print(sys.version_info.major, sys.version_info.minor)'],
+      { encoding: 'utf8', windowsHide: true, timeout: 8000 }
+    );
+    if (res.status === 0 && res.stdout) {
+      const parts = res.stdout.trim().split(' ');
+      if (parts.length === 2) {
+        return [parseInt(parts[0], 10), parseInt(parts[1], 10)];
       }
-    } catch {
-      // Continue searching
     }
+  } catch {
+    // ignore
   }
-  return isWin ? 'python' : 'python3';
+  return null;
 }
 
-function runCommand(cmd, args, onData) {
+// Returns true if [major, minor] is within the compatible range for our AI packages (3.9 – 3.12).
+function isPythonCompatible(ver) {
+  if (!ver) return false;
+  const [major, minor] = ver;
+  return major === 3 && minor >= 9 && minor <= 12;
+}
+
+function findSystemPython() {
+  const isWin = process.platform === 'win32';
+
+  // ── Windows: try explicit per-version py launcher flags first ──
+  if (isWin) {
+    // Preferred versions in order: 3.11 > 3.10 > 3.12 > 3.9
+    for (const minorVer of ['3.11', '3.10', '3.12', '3.9']) {
+      try {
+        const res = require('child_process').spawnSync(
+          'py', [`-${minorVer}`, '--version'],
+          { encoding: 'utf8', windowsHide: true, timeout: 5000 }
+        );
+        if (res.status === 0) {
+          const ver = getPythonVersion('py', [`-${minorVer}`]);
+          if (isPythonCompatible(ver)) {
+            writeLog(`[Setup] Found compatible Python ${ver[0]}.${ver[1]} via py -${minorVer}`);
+            return `py -${minorVer}`;
+          }
+        }
+      } catch { /* continue */ }
+    }
+
+    // ── Full-path scan for standard Python installer locations ──
+    const localApp = process.env.LOCALAPPDATA || '';
+    const progFiles = process.env.ProgramFiles || '';
+    const progFilesX86 = process.env['ProgramFiles(x86)'] || '';
+    const winCandidates = [
+      // User installs (LOCALAPPDATA)
+      path.join(localApp, 'Programs', 'Python', 'Python311', 'python.exe'),
+      path.join(localApp, 'Programs', 'Python', 'Python310', 'python.exe'),
+      path.join(localApp, 'Programs', 'Python', 'Python312', 'python.exe'),
+      path.join(localApp, 'Programs', 'Python', 'Python39', 'python.exe'),
+      // System installs (Program Files)
+      path.join(progFiles, 'Python311', 'python.exe'),
+      path.join(progFiles, 'Python310', 'python.exe'),
+      path.join(progFiles, 'Python312', 'python.exe'),
+      path.join(progFiles, 'Python39', 'python.exe'),
+      path.join(progFilesX86, 'Python311', 'python.exe'),
+      path.join(progFilesX86, 'Python310', 'python.exe'),
+      // PATH-based names as last resort
+      'python311',
+      'python310',
+      'python312',
+      'python',
+      'python3',
+    ];
+    for (const cmd of winCandidates) {
+      try {
+        const ver = getPythonVersion(cmd);
+        if (isPythonCompatible(ver)) {
+          writeLog(`[Setup] Found compatible Python ${ver[0]}.${ver[1]} at: ${cmd}`);
+          return cmd;
+        }
+      } catch { /* continue */ }
+    }
+
+    return null; // No compatible Python found on Windows
+  }
+
+  // ── macOS / Linux ──
+  const unixCandidates = [
+    'python3.11',
+    'python3.10',
+    'python3.12',
+    'python3.9',
+    '/opt/homebrew/bin/python3.11',
+    '/opt/homebrew/bin/python3.10',
+    '/opt/homebrew/bin/python3.12',
+    '/usr/local/bin/python3.11',
+    '/usr/local/bin/python3.10',
+    '/usr/local/bin/python3.12',
+    '/usr/bin/python3.11',
+    '/usr/bin/python3.10',
+    '/usr/bin/python3',
+    'python3',
+    'python',
+  ];
+  for (const cmd of unixCandidates) {
+    try {
+      const ver = getPythonVersion(cmd);
+      if (isPythonCompatible(ver)) {
+        writeLog(`[Setup] Found compatible Python ${ver[0]}.${ver[1]} at: ${cmd}`);
+        return cmd;
+      }
+    } catch { /* continue */ }
+  }
+
+  return null; // No compatible Python found
+}
+
+// Downloads and sets up a portable Python 3.11 embeddable runtime for Windows.
+// This is used as a zero-dependency fallback when no compatible Python is on the system.
+async function downloadPortablePython() {
+  const PYTHON_VERSION = '3.11.9';
+  const PYTHON_EMBED_URL = `https://www.python.org/ftp/python/${PYTHON_VERSION}/python-${PYTHON_VERSION}-embed-amd64.zip`;
+  const GET_PIP_URL = 'https://bootstrap.pypa.io/get-pip.py';
+  const EMBED_DIR = path.join(RUNTIME_DIR, 'python-embed');
+  const EMBED_PYTHON = path.join(EMBED_DIR, 'python.exe');
+
+  if (fs.existsSync(EMBED_PYTHON)) {
+    writeLog('[Setup] Portable Python already exists, skipping download.');
+    return EMBED_PYTHON;
+  }
+
+  writeLog(`[Setup] No compatible system Python found. Downloading portable Python ${PYTHON_VERSION}...`);
+  broadcastEngineStatus({
+    progress: 8,
+    step: 'Downloading Python runtime...',
+    detail: `No compatible Python found on your system. Auto-downloading Python ${PYTHON_VERSION} (~8 MB)...`,
+    logs: [...engineState.logs, `[Setup] Downloading portable Python ${PYTHON_VERSION} from python.org...`]
+  });
+
+  if (!fs.existsSync(EMBED_DIR)) fs.mkdirSync(EMBED_DIR, { recursive: true });
+
+  const zipPath = path.join(RUNTIME_DIR, 'python-embed.zip');
+
+  // Download zip
+  await new Promise((resolve, reject) => {
+    const https = require('https');
+    const file = fs.createWriteStream(zipPath);
+    const req = https.get(PYTHON_EMBED_URL, (res) => {
+      if (res.statusCode !== 200) {
+        return reject(new Error(`Failed to download Python: HTTP ${res.statusCode}`));
+      }
+      res.pipe(file);
+      file.on('finish', () => file.close(resolve));
+    });
+    req.on('error', reject);
+    req.setTimeout(120000, () => {
+      req.destroy();
+      reject(new Error('Python download timed out. Check your internet connection.'));
+    });
+  });
+
+  writeLog('[Setup] Python download complete. Extracting...');
+  broadcastEngineStatus({
+    progress: 10,
+    step: 'Extracting Python runtime...',
+    detail: 'Unpacking portable Python...',
+    logs: [...engineState.logs, '[Setup] Extracting portable Python...']
+  });
+
+  // Extract using PowerShell on Windows (no external unzip dependency needed)
+  await runCommand('powershell', [
+    '-NoProfile', '-Command',
+    `Expand-Archive -Path '${zipPath}' -DestinationPath '${EMBED_DIR}' -Force`
+  ]);
+
+  fs.unlinkSync(zipPath);
+
+  // The embeddable package has pip disabled and import paths locked down.
+  // We must patch the ._pth file to enable site-packages, then bootstrap pip.
+  const pthFiles = fs.readdirSync(EMBED_DIR).filter(f => f.endsWith('._pth'));
+  if (pthFiles.length > 0) {
+    const pthPath = path.join(EMBED_DIR, pthFiles[0]);
+    let pthContent = fs.readFileSync(pthPath, 'utf8');
+    // Uncomment the 'import site' line so pip and installed packages are importable
+    pthContent = pthContent.replace('#import site', 'import site');
+    fs.writeFileSync(pthPath, pthContent, 'utf8');
+    writeLog('[Setup] Patched ._pth file to enable site-packages.');
+  }
+
+  // Bootstrap pip into the embeddable python
+  writeLog('[Setup] Bootstrapping pip into portable Python...');
+  broadcastEngineStatus({
+    progress: 12,
+    step: 'Setting up package manager...',
+    detail: 'Installing pip into the portable Python runtime...',
+    logs: [...engineState.logs, '[Setup] Bootstrapping pip...']
+  });
+
+  const getPipPath = path.join(EMBED_DIR, 'get-pip.py');
+  await new Promise((resolve, reject) => {
+    const https = require('https');
+    const file = fs.createWriteStream(getPipPath);
+    const req = https.get(GET_PIP_URL, (res) => {
+      if (res.statusCode !== 200) {
+        return reject(new Error(`Failed to download get-pip.py: HTTP ${res.statusCode}`));
+      }
+      res.pipe(file);
+      file.on('finish', () => file.close(resolve));
+    });
+    req.on('error', reject);
+    req.setTimeout(60000, () => {
+      req.destroy();
+      reject(new Error('pip download timed out.'));
+    });
+  });
+
+  await runCommand(EMBED_PYTHON, [getPipPath, '--no-warn-script-location']);
+  fs.unlinkSync(getPipPath);
+
+  writeLog(`[Setup] Portable Python ${PYTHON_VERSION} is ready at: ${EMBED_PYTHON}`);
+  return EMBED_PYTHON;
+}
+
+function runCommand(cmd, args, onData, timeoutMs = 300000) {
   return new Promise((resolve, reject) => {
     let actualCmd = cmd;
     let actualArgs = args;
@@ -103,7 +342,8 @@ function runCommand(cmd, args, onData) {
       actualCmd = 'py';
       actualArgs = ['-3', ...args];
     }
-    console.log(`[Runtime Manager] Running: ${actualCmd} ${actualArgs.join(' ')}`);
+    const cmdStr = `${actualCmd} ${actualArgs.join(' ')}`;
+    writeLog(`[Runtime Manager] Running: ${cmdStr}`);
     const proc = spawn(actualCmd, actualArgs, {
       env: { ...process.env, PYTHONUNBUFFERED: '1' },
       windowsHide: true,
@@ -111,9 +351,22 @@ function runCommand(cmd, args, onData) {
       stdio: ['ignore', 'pipe', 'pipe']
     });
 
+    let timedOut = false;
+    let lastDataTime = Date.now();
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      const msg = `[TIMEOUT] Command timed out after ${Math.round(timeoutMs / 1000)}s: ${cmdStr}`;
+      writeLog(msg);
+      engineState.logs.push(msg);
+      broadcastEngineStatus();
+      try { proc.kill(); } catch {}
+      reject(new Error(msg));
+    }, timeoutMs);
+
     proc.stdout.on('data', (data) => {
+      lastDataTime = Date.now();
       const text = data.toString();
-      console.log(`[Setup stdout] ${text.trim()}`);
+      writeLog(`[stdout] ${text.trim()}`);
       if (onData) onData(text);
       engineState.logs.push(text.trim());
       if (engineState.logs.length > 200) engineState.logs.shift();
@@ -121,8 +374,9 @@ function runCommand(cmd, args, onData) {
     });
 
     proc.stderr.on('data', (data) => {
+      lastDataTime = Date.now();
       const text = data.toString();
-      console.log(`[Setup stderr] ${text.trim()}`);
+      writeLog(`[stderr] ${text.trim()}`);
       if (onData) onData(text);
       engineState.logs.push(text.trim());
       if (engineState.logs.length > 200) engineState.logs.shift();
@@ -130,11 +384,24 @@ function runCommand(cmd, args, onData) {
     });
 
     proc.on('close', (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`Command ${cmd} exited with code ${code}`));
+      clearTimeout(timeoutTimer);
+      if (timedOut) return;
+      if (code === 0) {
+        writeLog(`[Success] Command completed: ${cmdStr}`);
+        resolve();
+      } else {
+        const errMsg = `Command ${cmd} exited with code ${code}`;
+        writeLog(`[Error] ${errMsg}`);
+        reject(new Error(errMsg));
+      }
     });
 
-    proc.on('error', (err) => reject(err));
+    proc.on('error', (err) => {
+      clearTimeout(timeoutTimer);
+      if (timedOut) return;
+      writeLog(`[Error] Spawn error for ${cmd}: ${err.message}`);
+      reject(err);
+    });
   });
 }
 
@@ -196,18 +463,33 @@ async function verifyVenvHealth() {
 async function installRuntime() {
   if (engineState.status === 'installing') return;
 
+  writeLog('[Setup] ====== Starting AI Engine initialization ======');
   broadcastEngineStatus({
     status: 'installing',
     progress: 5,
     step: 'Initializing AI Engine...',
-    detail: 'Setting up dedicated environment in Application Support...',
+    detail: 'Setting up dedicated environment...',
     logs: ['[Setup] Starting AI Engine initialization...']
   });
 
   try {
     if (!fs.existsSync(RUNTIME_DIR)) fs.mkdirSync(RUNTIME_DIR, { recursive: true });
 
-    const systemPython = findSystemPython();
+    // Resolve a compatible Python interpreter (3.9–3.12).
+    // If none is found on the system, auto-download a portable Python 3.11 embeddable.
+    let systemPython = findSystemPython();
+    if (!systemPython) {
+      if (process.platform !== 'win32') {
+        // On macOS/Linux: cannot auto-download — surface a clear message
+        throw new Error(
+          'No compatible Python (3.9–3.12) found on your system.\n' +
+          'Please install Python 3.11 from https://www.python.org/downloads/ and relaunch Unweave.'
+        );
+      }
+      // On Windows: silently download a portable Python 3.11 embeddable
+      const embedPython = await downloadPortablePython();
+      systemPython = embedPython;
+    }
     broadcastEngineStatus({
       progress: 15,
       step: 'Creating Python virtual environment...',
@@ -258,23 +540,26 @@ async function installRuntime() {
     });
 
     const torchIndexUrl = 'https://download.pytorch.org/whl/cpu';
+    const TORCH_TIMEOUT = 900000; // 15 minutes for PyTorch download (500MB-1GB)
     try {
       await runCommand(VENV_PYTHON, [
         '-m', 'pip', 'install',
         'torch', 'torchaudio',
         '--extra-index-url', torchIndexUrl,
         '--prefer-binary',
+        '--only-binary', 'torch,torchaudio',
         '--no-warn-script-location'
-      ]);
+      ], null, TORCH_TIMEOUT);
     } catch (torchErr) {
-      console.warn('[Setup] PyTorch install with index URL failed, falling back to default PyPI...', torchErr.message);
+      writeLog('[Setup] PyTorch install with index URL failed: ' + torchErr.message);
       // Fallback: try without index URL (may still work on many systems)
       await runCommand(VENV_PYTHON, [
         '-m', 'pip', 'install',
         'torch', 'torchaudio',
         '--prefer-binary',
+        '--only-binary', 'torch,torchaudio',
         '--no-warn-script-location'
-      ]);
+      ], null, TORCH_TIMEOUT);
     }
 
     // 4. Install remaining requirements
@@ -296,6 +581,7 @@ async function installRuntime() {
         await runCommand(VENV_PYTHON, [
           '-m', 'pip', 'install', '-r', reqFile,
           '--prefer-binary',
+          '--only-binary', 'lameenc,soxr',
           '--no-warn-script-location'
         ]);
       } catch (reqErr) {
@@ -306,12 +592,14 @@ async function installRuntime() {
           detail: 'Some optional packages failed — installing core dependencies only...',
           logs: [...engineState.logs, '[Setup] Retrying minimal install...']
         });
-        // Minimal fallback that will definitely work on all platforms
+        // Minimal fallback — guaranteed to work on all platforms with binary wheels
         await runCommand(VENV_PYTHON, [
           '-m', 'pip', 'install',
           'fastapi', 'uvicorn[standard]', 'python-multipart', 'aiofiles',
           'numpy<2', 'scipy', 'demucs', 'imageio-ffmpeg',
-          '--prefer-binary', '--no-warn-script-location'
+          '--prefer-binary',
+          '--only-binary', 'lameenc,soxr',
+          '--no-warn-script-location'
         ]);
       }
     } else {
@@ -319,7 +607,9 @@ async function installRuntime() {
         '-m', 'pip', 'install',
         'fastapi', 'uvicorn[standard]', 'python-multipart', 'aiofiles',
         'numpy<2', 'scipy', 'demucs', 'imageio-ffmpeg',
-        '--prefer-binary', '--no-warn-script-location'
+        '--prefer-binary',
+        '--only-binary', 'lameenc,soxr',
+        '--no-warn-script-location'
       ]);
     }
 
@@ -349,15 +639,16 @@ async function installRuntime() {
 
     await startBackendSupervisor();
 
+    writeLog('[SUCCESS] AI Engine setup completed successfully!');
     broadcastEngineStatus({
       status: 'ready',
       progress: 100,
       step: 'AI Engine Ready!',
       detail: 'Unweave Studio is ready to separate stems.',
-      logs: [...engineState.logs, '[Setup] Setup completed successfully!']
+      logs: [...engineState.logs, '[SUCCESS] Setup completed successfully!']
     });
   } catch (err) {
-    console.error('[Unweave Desktop] Installation error:', err);
+    writeLog(`[FATAL ERROR] Installation failed: ${err.message}`);
     broadcastEngineStatus({
       status: 'error',
       progress: 0,
@@ -457,15 +748,25 @@ async function startBackendSupervisor() {
 
 function stopBackendProcess() {
   if (backendProcess) {
-    console.log('[Unweave Desktop] Terminating backend daemon...');
+    writeLog('[Shutdown] Terminating backend daemon...');
     try {
-      backendProcess.kill('SIGTERM');
-      setTimeout(() => {
-        if (backendProcess) {
-          backendProcess.kill('SIGKILL');
-          backendProcess = null;
+      if (process.platform === 'win32') {
+        // Windows: SIGTERM is not supported; use taskkill to forcefully end the process tree
+        try {
+          execSync(`taskkill /F /T /PID ${backendProcess.pid}`, { windowsHide: true });
+        } catch {
+          // taskkill may fail if process already exited
         }
-      }, 2000);
+        backendProcess = null;
+      } else {
+        backendProcess.kill('SIGTERM');
+        setTimeout(() => {
+          if (backendProcess) {
+            backendProcess.kill('SIGKILL');
+            backendProcess = null;
+          }
+        }, 2000);
+      }
     } catch {
       // Ignored on exit
     }
@@ -951,17 +1252,37 @@ ipcMain.handle('engine:repair', async () => {
   try {
     fs.rmSync(VENV_DIR, { recursive: true, force: true });
   } catch (err) {
-    console.warn('[Unweave Desktop] Could not clean venv:', err.message);
+    writeLog('[Repair] Could not clean venv: ' + err.message);
   }
   installRuntime().catch(() => {});
   return { success: true };
+});
+
+// Log file IPC APIs
+ipcMain.handle('logs:open-file', async () => {
+  try {
+    if (fs.existsSync(LOG_FILE_PATH)) {
+      await shell.openPath(LOG_FILE_PATH);
+      return { success: true, path: LOG_FILE_PATH };
+    } else {
+      return { success: false, error: 'Log file not found yet. Logs will appear after the first setup attempt.' };
+    }
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('logs:get-path', async () => {
+  return LOG_FILE_PATH;
 });
 
 // ──────────────────────────────────────────────
 // App Lifecycle
 // ──────────────────────────────────────────────
 app.whenReady().then(async () => {
+  initLogFile();
   ensureProjectDirs();
+  writeLog('[Lifecycle] App ready — starting backend supervisor...');
   await startBackendSupervisor();
   await createMainWindow();
 
@@ -973,7 +1294,9 @@ app.whenReady().then(async () => {
 });
 
 app.on('before-quit', () => {
+  writeLog('[Lifecycle] App quitting — stopping backend process...');
   stopBackendProcess();
+  closeLogFile();
 });
 
 app.on('window-all-closed', () => {
