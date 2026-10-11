@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Cpu, RefreshCw, AlertTriangle, CheckCircle, Terminal, ChevronDown, ChevronUp, Sparkles, Wrench } from 'lucide-react';
+import React, { useState, useRef, useEffect } from 'react';
+import { Cpu, RefreshCw, AlertTriangle, CheckCircle, Terminal, ChevronDown, ChevronUp, Sparkles, Wrench, FileText } from 'lucide-react';
 import type { EngineState } from '../../types';
 
 interface EngineSetupModalProps {
@@ -9,6 +9,20 @@ interface EngineSetupModalProps {
     onClose?: () => void;
 }
 
+function getLogLineColor(log: string): string {
+    const lower = log.toLowerCase();
+    if (lower.includes('[error]') || lower.includes('[timeout]') || lower.includes('[fatal')) {
+        return 'text-rose-400';
+    }
+    if (lower.includes('[success]') || lower.includes('ok') && lower.includes('setup completed')) {
+        return 'text-emerald-400';
+    }
+    if (lower.includes('[setup]') || lower.includes('[status]')) {
+        return 'text-amber-300';
+    }
+    return 'text-zinc-400';
+}
+
 export const EngineSetupModal: React.FC<EngineSetupModalProps> = ({
     engineState,
     onStartInstall,
@@ -16,11 +30,29 @@ export const EngineSetupModal: React.FC<EngineSetupModalProps> = ({
     onClose,
 }) => {
     const [showLogs, setShowLogs] = useState(false);
+    const logsEndRef = useRef<HTMLDivElement>(null);
 
     const isInstalling = engineState.status === 'installing';
     const isError = engineState.status === 'error';
     const isNeedsSetup = engineState.status === 'needs-setup';
     const isReady = engineState.status === 'ready';
+
+    const isDesktop = typeof window !== 'undefined' && Boolean(window.electronAPI?.isDesktop);
+    const platform = window.electronAPI?.platform || 'unknown';
+    const platformName = platform === 'darwin' ? 'macOS' : platform === 'win32' ? 'Windows' : 'Linux';
+
+    // Auto-scroll logs to bottom
+    useEffect(() => {
+        if (showLogs && logsEndRef.current) {
+            logsEndRef.current.scrollIntoView({ behavior: 'smooth' });
+        }
+    }, [showLogs, engineState.logs?.length]);
+
+    const handleOpenLogFile = async () => {
+        if (window.electronAPI?.openLogFile) {
+            await window.electronAPI.openLogFile();
+        }
+    };
 
     return (
         <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/85 backdrop-blur-2xl animate-in fade-in duration-300">
@@ -75,12 +107,12 @@ export const EngineSetupModal: React.FC<EngineSetupModalProps> = ({
                         </h2>
                         <p className="text-zinc-400 text-xs mt-1 leading-relaxed">
                             {isError
-                                ? 'Could not automatically configure the Python AI backend environment. You can retry or rebuild the environment.'
+                                ? 'Could not automatically configure the Python AI backend environment. You can retry or rebuild the environment. Check the log file for details.'
                                 : isReady
                                 ? 'The standalone AI separation engine and hardware acceleration are configured and active.'
                                 : isInstalling
-                                ? 'Setting up PyTorch & Demucs neural network isolation engine natively on your Mac. This happens once and takes ~1-2 minutes.'
-                                : 'To run studio-grade 6-stem separation natively on your Mac, Unweave sets up a dedicated environment in Application Support.'}
+                                ? `Setting up PyTorch & Demucs neural network isolation engine natively on your ${platformName} computer. This happens once and takes ~1-2 minutes.`
+                                : `To run studio-grade 6-stem separation natively on your ${platformName} computer, Unweave sets up a dedicated environment in your application data folder.`}
                         </p>
                     </div>
                 </div>
@@ -124,9 +156,9 @@ export const EngineSetupModal: React.FC<EngineSetupModalProps> = ({
                             <span>What happens during initial setup?</span>
                         </div>
                         <ul className="space-y-1.5 text-zinc-400 pl-5 list-disc marker:text-amber-500">
-                            <li>Creates an isolated virtual environment at <code className="text-amber-300 bg-zinc-950 px-1 py-0.5 rounded text-[10px]">~/Library/Application Support/Unweave Studio/runtime/venv</code></li>
+                            <li>Creates an isolated Python virtual environment in your application data folder</li>
                             <li>Installs native PyTorch & Demucs neural network isolation wheels</li>
-                            <li>Auto-activates Apple Silicon Metal (MPS) / CUDA GPU hardware acceleration</li>
+                            <li>Auto-activates available GPU hardware acceleration (Metal / CUDA / CPU fallback)</li>
                             <li>Completely self-contained: subsequent launches take less than 1 second</li>
                         </ul>
                     </div>
@@ -158,66 +190,84 @@ export const EngineSetupModal: React.FC<EngineSetupModalProps> = ({
                         </button>
 
                         {showLogs && (
-                            <div className="p-3 bg-black/80 font-mono text-[10px] text-zinc-300 max-h-44 overflow-y-auto space-y-1 border-t border-zinc-900 scrollbar-thin scrollbar-thumb-zinc-800">
+                            <div className="p-3 bg-black/80 font-mono text-[10px] max-h-44 overflow-y-auto space-y-1 border-t border-zinc-900 scrollbar-thin scrollbar-thumb-zinc-800">
                                 {engineState.logs.slice(-50).map((log, idx) => (
-                                    <div key={idx} className="leading-relaxed opacity-90 truncate">
+                                    <div key={idx} className={`leading-relaxed opacity-90 truncate ${getLogLineColor(log)}`}>
                                         {log}
                                     </div>
                                 ))}
+                                <div ref={logsEndRef} />
                             </div>
                         )}
                     </div>
                 )}
 
                 {/* Action Buttons */}
-                <div className="flex items-center justify-end gap-3 pt-2">
-                    {isError && (
-                        <>
+                <div className="flex items-center justify-between gap-3 pt-2">
+                    {/* Open Log File — always visible on desktop */}
+                    <div>
+                        {isDesktop && (
                             <button
                                 type="button"
-                                onClick={onRepair}
-                                className="px-4 py-2.5 rounded-xl border border-zinc-700 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-semibold flex items-center gap-2 transition-all active:scale-95"
+                                onClick={handleOpenLogFile}
+                                className="px-3 py-2 rounded-xl border border-zinc-700/80 bg-zinc-900 hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200 text-[11px] font-mono flex items-center gap-1.5 transition-all active:scale-95"
+                                title="Open the persistent install log file in your default text editor"
                             >
-                                <Wrench className="w-3.5 h-3.5" />
-                                Rebuild Runtime
+                                <FileText className="w-3.5 h-3.5" />
+                                Open Log File
                             </button>
+                        )}
+                    </div>
+
+                    <div className="flex items-center gap-3">
+                        {isError && (
+                            <>
+                                <button
+                                    type="button"
+                                    onClick={onRepair}
+                                    className="px-4 py-2.5 rounded-xl border border-zinc-700 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-semibold flex items-center gap-2 transition-all active:scale-95"
+                                >
+                                    <Wrench className="w-3.5 h-3.5" />
+                                    Rebuild Runtime
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={onStartInstall}
+                                    className="px-5 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-black text-xs font-bold flex items-center gap-2 shadow-[0_0_20px_rgba(245,158,11,0.3)] transition-all active:scale-95"
+                                >
+                                    <RefreshCw className="w-3.5 h-3.5" />
+                                    Retry Setup
+                                </button>
+                            </>
+                        )}
+
+                        {isNeedsSetup && (
                             <button
                                 type="button"
                                 onClick={onStartInstall}
-                                className="px-5 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-black text-xs font-bold flex items-center gap-2 shadow-[0_0_20px_rgba(245,158,11,0.3)] transition-all active:scale-95"
+                                className="w-full py-3 rounded-2xl bg-gradient-to-r from-amber-500 to-yellow-400 hover:from-amber-400 hover:to-yellow-300 text-black text-sm font-bold flex items-center justify-center gap-2 shadow-[0_0_30px_rgba(245,158,11,0.35)] transition-all active:scale-[0.99]"
                             >
-                                <RefreshCw className="w-3.5 h-3.5" />
-                                Retry Setup
+                                <Sparkles className="w-4 h-4" />
+                                Initialize Unweave AI Engine
                             </button>
-                        </>
-                    )}
+                        )}
 
-                    {isNeedsSetup && (
-                        <button
-                            type="button"
-                            onClick={onStartInstall}
-                            className="w-full py-3 rounded-2xl bg-gradient-to-r from-amber-500 to-yellow-400 hover:from-amber-400 hover:to-yellow-300 text-black text-sm font-bold flex items-center justify-center gap-2 shadow-[0_0_30px_rgba(245,158,11,0.35)] transition-all active:scale-[0.99]"
-                        >
-                            <Sparkles className="w-4 h-4" />
-                            Initialize Unweave AI Engine
-                        </button>
-                    )}
+                        {isInstalling && (
+                            <div className="w-full text-center text-xs text-zinc-500 font-mono py-1">
+                                Please wait while dependencies are configured...
+                            </div>
+                        )}
 
-                    {isInstalling && (
-                        <div className="w-full text-center text-xs text-zinc-500 font-mono py-1">
-                            Please wait while dependencies are configured...
-                        </div>
-                    )}
-
-                    {isReady && onClose && (
-                        <button
-                            type="button"
-                            onClick={onClose}
-                            className="px-6 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-black text-xs font-bold transition-all active:scale-95"
-                        >
-                            Open Unweave Studio
-                        </button>
-                    )}
+                        {isReady && onClose && (
+                            <button
+                                type="button"
+                                onClick={onClose}
+                                className="px-6 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-black text-xs font-bold transition-all active:scale-95"
+                            >
+                                Open Unweave Studio
+                            </button>
+                        )}
+                    </div>
                 </div>
             </div>
         </div>

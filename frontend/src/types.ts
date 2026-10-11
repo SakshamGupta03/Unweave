@@ -166,6 +166,8 @@ declare global {
             startEngineInstall?: () => Promise<{ success: boolean }>;
             repairEngine?: () => Promise<{ success: boolean }>;
             onEngineStatus?: (callback: (state: EngineState) => void) => () => void;
+            openLogFile?: () => Promise<{ success: boolean; path?: string; error?: string }>;
+            getLogPath?: () => Promise<string>;
         };
     }
 }

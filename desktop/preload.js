@@ -32,4 +32,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('engine:status-update', subscription);
     return () => ipcRenderer.removeListener('engine:status-update', subscription);
   },
+  // Persistent Log File APIs
+  openLogFile: () => ipcRenderer.invoke('logs:open-file'),
+  getLogPath: () => ipcRenderer.invoke('logs:get-path'),
 });
