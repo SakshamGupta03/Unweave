@@ -92,6 +92,9 @@ const VENV_DIR = path.join(RUNTIME_DIR, 'venv');
 const VENV_PYTHON = process.platform === 'win32'
   ? path.join(VENV_DIR, 'Scripts', 'python.exe')
   : path.join(VENV_DIR, 'bin', 'python');
+// Path to the portable embeddable Python executable (Windows-only fallback)
+const EMBED_DIR = path.join(RUNTIME_DIR, 'python-embed');
+const EMBED_PYTHON = path.join(EMBED_DIR, 'python.exe');
 
 let engineState = {
   status: 'checking', // 'ready' | 'needs-setup' | 'installing' | 'error'
@@ -405,10 +408,14 @@ function runCommand(cmd, args, onData, timeoutMs = 300000) {
   });
 }
 
-async function verifyVenvHealth() {
-  // On packaged builds use the managed venv; in dev also accept the project-local venv.
+async function verifyVenvHealth(pythonOverride = null) {
+  // Allow caller to supply the exact python to test (e.g. embed python).
+  // On packaged builds fall back to the managed venv; in dev also accept the project-local venv.
   const devVenvPy = path.join(__dirname, '..', 'backend', '.venv', 'bin', 'python');
-  const pyToTest = (isDev && fs.existsSync(devVenvPy)) ? devVenvPy : VENV_PYTHON;
+  let pyToTest = pythonOverride;
+  if (!pyToTest) {
+    pyToTest = (isDev && fs.existsSync(devVenvPy)) ? devVenvPy : VENV_PYTHON;
+  }
 
   if (!fs.existsSync(pyToTest)) {
     console.log('[Verifier] Python binary not found at:', pyToTest);
@@ -478,6 +485,11 @@ async function installRuntime() {
     // Resolve a compatible Python interpreter (3.9–3.12).
     // If none is found on the system, auto-download a portable Python 3.11 embeddable.
     let systemPython = findSystemPython();
+    // Track whether we are using the portable embeddable Python.
+    // The embeddable ZIP does NOT ship venv or ensurepip, so we must skip
+    // venv creation and use the embed dir as the install target directly.
+    let usingEmbedPython = false;
+
     if (!systemPython) {
       if (process.platform !== 'win32') {
         // On macOS/Linux: cannot auto-download — surface a clear message
@@ -487,18 +499,28 @@ async function installRuntime() {
         );
       }
       // On Windows: silently download a portable Python 3.11 embeddable
-      const embedPython = await downloadPortablePython();
-      systemPython = embedPython;
+      await downloadPortablePython();
+      systemPython = EMBED_PYTHON;
+      usingEmbedPython = true;
     }
+
+    // Also treat it as embed mode if a previous install left the embed python
+    // but no venv (e.g. the user clicked "Rebuild Runtime" after a partial run).
+    if (!usingEmbedPython && systemPython === EMBED_PYTHON) {
+      usingEmbedPython = true;
+    }
+
     broadcastEngineStatus({
       progress: 15,
-      step: 'Creating Python virtual environment...',
+      step: usingEmbedPython ? 'Configuring portable Python runtime...' : 'Creating Python virtual environment...',
       detail: `Setting up isolated environment (${systemPython})...`,
-      logs: [...engineState.logs, `[Setup] Creating virtual environment at ${VENV_DIR}...`]
+      logs: [...engineState.logs, usingEmbedPython
+        ? '[Setup] Using portable Python embed (skipping venv — not supported by embeddable Python)'
+        : `[Setup] Creating virtual environment at ${VENV_DIR}...`]
     });
 
-    // 1. Create Virtualenv if missing
-    if (!fs.existsSync(VENV_PYTHON)) {
+    // 1. Create Virtualenv if missing (only when NOT using embeddable Python)
+    if (!usingEmbedPython && !fs.existsSync(VENV_PYTHON)) {
       try {
         await runCommand(systemPython, ['-m', 'venv', VENV_DIR]);
       } catch (venvErr) {
@@ -512,6 +534,13 @@ async function installRuntime() {
       }
     }
 
+    // Determine the active Python to use for all subsequent pip/verify steps.
+    // When using the embeddable Python we install packages directly into the embed
+    // dir (pip was bootstrapped into it by downloadPortablePython), so there is no
+    // venv. All steps below use `activePython` rather than the module-level VENV_PYTHON.
+    const activePython = usingEmbedPython ? EMBED_PYTHON : VENV_PYTHON;
+    writeLog(`[Setup] Active Python for install steps: ${activePython}`);
+
     // 2. Upgrade pip
     broadcastEngineStatus({
       progress: 25,
@@ -520,7 +549,7 @@ async function installRuntime() {
       logs: [...engineState.logs, '[Setup] Upgrading pip...']
     });
     try {
-      await runCommand(VENV_PYTHON, [
+      await runCommand(activePython, [
         '-m', 'pip', 'install', '--upgrade', 'pip',
         '--no-warn-script-location', '--quiet'
       ]);
@@ -542,7 +571,7 @@ async function installRuntime() {
     const torchIndexUrl = 'https://download.pytorch.org/whl/cpu';
     const TORCH_TIMEOUT = 900000; // 15 minutes for PyTorch download (500MB-1GB)
     try {
-      await runCommand(VENV_PYTHON, [
+      await runCommand(activePython, [
         '-m', 'pip', 'install',
         'torch', 'torchaudio',
         '--extra-index-url', torchIndexUrl,
@@ -553,7 +582,7 @@ async function installRuntime() {
     } catch (torchErr) {
       writeLog('[Setup] PyTorch install with index URL failed: ' + torchErr.message);
       // Fallback: try without index URL (may still work on many systems)
-      await runCommand(VENV_PYTHON, [
+      await runCommand(activePython, [
         '-m', 'pip', 'install',
         'torch', 'torchaudio',
         '--prefer-binary',
@@ -578,7 +607,7 @@ async function installRuntime() {
 
     if (fs.existsSync(reqFile)) {
       try {
-        await runCommand(VENV_PYTHON, [
+        await runCommand(activePython, [
           '-m', 'pip', 'install', '-r', reqFile,
           '--prefer-binary',
           '--only-binary', 'lameenc,soxr',
@@ -593,7 +622,7 @@ async function installRuntime() {
           logs: [...engineState.logs, '[Setup] Retrying minimal install...']
         });
         // Minimal fallback — guaranteed to work on all platforms with binary wheels
-        await runCommand(VENV_PYTHON, [
+        await runCommand(activePython, [
           '-m', 'pip', 'install',
           'fastapi', 'uvicorn[standard]', 'python-multipart', 'aiofiles',
           'numpy<2', 'scipy', 'demucs', 'imageio-ffmpeg',
@@ -603,7 +632,7 @@ async function installRuntime() {
         ]);
       }
     } else {
-      await runCommand(VENV_PYTHON, [
+      await runCommand(activePython, [
         '-m', 'pip', 'install',
         'fastapi', 'uvicorn[standard]', 'python-multipart', 'aiofiles',
         'numpy<2', 'scipy', 'demucs', 'imageio-ffmpeg',
@@ -621,7 +650,7 @@ async function installRuntime() {
       logs: [...engineState.logs, '[Setup] Running health verification...']
     });
 
-    const isHealthy = await verifyVenvHealth();
+    const isHealthy = await verifyVenvHealth(activePython);
     if (!isHealthy) {
       throw new Error(
         'AI Engine verification failed. Please check your Python version (3.9–3.12 required) ' +
@@ -685,6 +714,11 @@ async function startBackendSupervisor() {
     launchCmd = devWorkspacePy;
   } else if (fs.existsSync(VENV_PYTHON)) {
     launchCmd = VENV_PYTHON;
+  } else if (process.platform === 'win32' && fs.existsSync(EMBED_PYTHON)) {
+    // Fallback: use portable embeddable Python directly (no venv needed — pip
+    // packages were installed into its site-packages by installRuntime).
+    writeLog('[Supervisor] No venv found — using portable embed Python to launch backend.');
+    launchCmd = EMBED_PYTHON;
   }
 
   if (!launchCmd) {

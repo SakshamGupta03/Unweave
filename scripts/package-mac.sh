@@ -64,8 +64,8 @@ plutil -replace CFBundleDisplayName -string "Unweave" "$PLIST"
 plutil -replace CFBundleName -string "Unweave" "$PLIST"
 plutil -replace CFBundleExecutable -string "Unweave" "$PLIST"
 plutil -replace CFBundleIdentifier -string "com.unweave.studio" "$PLIST"
-plutil -replace CFBundleShortVersionString -string "1.0.0" "$PLIST"
-plutil -replace CFBundleVersion -string "1.0.0" "$PLIST"
+plutil -replace CFBundleShortVersionString -string "1.0.2" "$PLIST"
+plutil -replace CFBundleVersion -string "1.0.2" "$PLIST"
 plutil -replace CFBundleIconFile -string "Unweave.icns" "$PLIST"
 
 # Remove Electron default app

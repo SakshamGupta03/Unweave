@@ -1,7 +1,7 @@
 {
   "name": "unweave-desktop",
   "productName": "Unweave",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "AI Audio Stem Separation & Studio DAW Suite",
   "main": "main.js",
   "author": "Unweave",
